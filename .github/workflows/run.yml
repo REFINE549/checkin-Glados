@@ -9,10 +9,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # 【新增】：赋予 GITHUB_TOKEN 推送代码的权限
-    permissions:
-      contents: write
-      
+    
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3
@@ -23,21 +20,3 @@ jobs:
         env:
           GLADOS: ${{ secrets.GLADOS }}
           NOTIFY: ${{ secrets.NOTIFY }}
-
-# 【新增】：自动提交代码以保持仓库活跃的步骤
-      - name: Auto commit to keep repository active
-        run: |
-          # 创建隐藏文件夹存放保活文件，避免弄乱你的根目录
-          mkdir -p .github
-          
-          # 写入当前运行的时间戳
-          date +%Y-%m-%d_%H:%M:%S > .github/keep_alive.txt
-          
-          # 配置 GitHub 官方机器人的身份信息
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          # 提交并推送
-          git add .github/keep_alive.txt
-          git commit -m "chore: auto commit to keep workflow alive" || echo "No changes to commit"
-          git push
