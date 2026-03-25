@@ -1,0 +1,32 @@
+name: Monthly Keep Alive
+
+on:
+  schedule:
+    # 这里的 cron 表达式意思是：每个月 1 号的 UTC 0点（北京时间早上 8 点）运行一次
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    # 必须赋予推送代码的权限
+    permissions:
+      contents: write 
+      
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Monthly auto commit to keep repository active
+        run: |
+          mkdir -p .github
+          # 写入当月运行的时间戳
+          date +%Y-%m-%d_%H:%M:%S > .github/keep_alive.txt
+          
+          # 配置 GitHub 官方机器人的身份信息
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 提交并推送
+          git add .github/keep_alive.txt
+          git commit -m "chore: monthly auto commit to keep workflow alive" || echo "No changes to commit"
+          git push
