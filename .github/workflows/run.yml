@@ -19,4 +19,5 @@ jobs:
       - run: npm run main
         env:
           GLADOS: ${{ secrets.GLADOS }}
+          RAILGUN: ${{ secrets.RAILGUN }}
           NOTIFY: ${{ secrets.NOTIFY }}
