@@ -1,40 +1,68 @@
 const glados = async () => {
   const notice = []
-  if (!process.env.GLADOS) return
-  for (const cookie of String(process.env.GLADOS).split('\n')) {
-    if (!cookie) continue
+
+  // 通用的签到执行函数
+  const doCheckin = async (cookie, domain, token) => {
+    if (!cookie) return
     try {
       const common = {
         'cookie': cookie,
-        'referer': 'https://glados.cloud/console/checkin',
-        'user-agent': 'Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)',
+        'referer': `https://${domain}/console/checkin`,
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       }
-      const action = await fetch('https://glados.cloud/api/user/checkin', {
+      const action = await fetch(`https://${domain}/api/user/checkin`, {
         method: 'POST',
         headers: { ...common, 'content-type': 'application/json' },
-        body: '{"token":"glados.cloud"}',
+        body: JSON.stringify({ token: token }),
       }).then((r) => r.json())
+      
       if (action?.code) throw new Error(action?.message)
-      const status = await fetch('https://glados.cloud/api/user/status', {
+      
+      const status = await fetch(`https://${domain}/api/user/status`, {
         method: 'GET',
         headers: { ...common },
       }).then((r) => r.json())
+      
       if (status?.code) throw new Error(status?.message)
+      
       notice.push(
-        'Checkin OK',
+        `[${domain}] Checkin OK`,
         `${action?.message}`,
         `Left Days ${Number(status?.data?.leftDays)}`
       )
     } catch (error) {
       notice.push(
-        'Checkin Error',
+        `[${domain}] Checkin Error`,
         `${error}`,
         `<${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`
       )
     }
   }
+
+  // 1. 处理原站点 (glados.cloud) 的账号签到
+  if (process.env.GLADOS) {
+    for (const cookie of String(process.env.GLADOS).split('\n')) {
+      if (cookie.trim()) {
+        await doCheckin(cookie.trim(), 'glados.cloud', 'glados.cloud')
+      }
+    }
+  }
+
+  // 2. 处理新站点 (railgun.info) 的账号签到
+  if (process.env.RAILGUN) {
+    for (const cookie of String(process.env.RAILGUN).split('\n')) {
+      if (cookie.trim()) {
+        // 若签到报错 token 错误，可将下方的 'glados.network' 改回 'glados.cloud' 尝试
+        await doCheckin(cookie.trim(), 'railgun.info', 'glados.network') 
+      }
+    }
+  }
+
   return notice
 }
+
+// 确保包含调用执行部分
+// glados().then(console.log);
 
 const notify = async (notice) => {
   if (!process.env.NOTIFY || !notice) return
