@@ -21,3 +21,4 @@ jobs:
           GLADOS: ${{ secrets.GLADOS }}
           RAILGUN: ${{ secrets.RAILGUN }}
           NOTIFY: ${{ secrets.NOTIFY }}
+          GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT }}
