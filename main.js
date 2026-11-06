@@ -25,7 +25,7 @@ class RequestError extends Error {
   }
 }
 
-const safeError = (error) => {
+function safeError(error) {
   if (error?.status) return `HTTP ${error.status}`
 
   const message = String(error?.message || 'Unknown error')
@@ -37,7 +37,7 @@ const safeError = (error) => {
   return message.slice(0, 180)
 }
 
-const isAuthDenied = (error) => {
+function isAuthDenied(error) {
   return (
     error?.status === 401 ||
     error?.status === 403 ||
@@ -47,24 +47,40 @@ const isAuthDenied = (error) => {
   )
 }
 
-const isNormalCheckinResult = (result) => {
-  if (!result || typeof result !== 'object') return false
+// -------------------- 签到结果识别 --------------------
+
+function getCheckinResult(result) {
+  if (!result || typeof result !== 'object') {
+    return {
+      success: false,
+      alreadyChecked: false,
+    }
+  }
 
   const message = String(result.message || '').toLowerCase()
 
-  const normalMessages = [
+  const alreadyChecked =
+    message.includes('already checked in today') ||
+    message.includes('checkin repeats! please try tomorrow')
+
+  const successMessages = [
     'checkin! got',
-    'checkin repeats! please try tomorrow',
     "today's observation logged",
+    'already checked in today',
+    'checkin repeats! please try tomorrow',
   ]
 
-  return (
-    normalMessages.some((item) => message.includes(item)) ||
+  const success =
+    successMessages.some((item) => message.includes(item)) ||
     result.code === 0
-  )
+
+  return {
+    success,
+    alreadyChecked,
+  }
 }
 
-// -------------------- HTTP --------------------
+// -------------------- HTTP 请求 --------------------
 
 async function requestJson(url, options = {}) {
   let response
@@ -84,7 +100,6 @@ async function requestJson(url, options = {}) {
     )
   }
 
-  // 认证失败：不重试
   if (response.status === 401 || response.status === 403) {
     throw new RequestError(
       'Authentication rejected',
@@ -93,13 +108,8 @@ async function requestJson(url, options = {}) {
     )
   }
 
-  // API 不存在：不重试
   if (response.status === 404) {
-    throw new RequestError(
-      'HTTP 404',
-      404,
-      false
-    )
+    throw new RequestError('HTTP 404', 404, false)
   }
 
   let data
@@ -165,15 +175,12 @@ class GladosClient {
   }
 
   // --------------------
-  // 签到逻辑
+  // 签到请求
   // --------------------
 
   async checkinOnce() {
 
-    // ==================================================
-    // Railgun：恢复旧版直接签到协议
-    // ==================================================
-
+    // Railgun：使用旧版直接签到协议
     if (this.domain === 'railgun.info') {
       console.log(
         '[railgun.info] Using legacy check-in protocol'
@@ -190,26 +197,18 @@ class GladosClient {
       })
     }
 
-    // ==================================================
-    // GLaDOS：使用新版 Challenge 认证协议
-    // ==================================================
-
-    // 1. 获取一次性 Challenge
+    // GLaDOS：新版 Challenge 认证协议
     const challenge = await this.request(
       '/api/user/checkin/challenge',
       { method: 'GET' }
     )
 
     if (challenge.code !== 0) {
-      if (challenge.code === -2) {
-        throw new RequestError(
-          'Challenge authentication rejected',
-          null,
-          false
-        )
-      }
-
-      throw new RequestError('Challenge unavailable')
+      throw new RequestError(
+        'Challenge authentication rejected',
+        null,
+        false
+      )
     }
 
     const nonce = challenge.nonce
@@ -226,25 +225,20 @@ class GladosClient {
       throw new RequestError('Invalid Challenge')
     }
 
-    // 2. 记录获取时间
     const receivedAt = performance.now()
 
-    // 3. 按官网算法计算 proof
     const proof = createHash('sha256')
       .update(`${nonce}.glados-observe-v1`, 'utf8')
       .digest('hex')
 
-    // 4. 等待官网要求的时间
     await sleep(CONFIG.challengeWaitMs)
 
-    // 5. 检查 Challenge 是否过期
     const elapsed = performance.now() - receivedAt
 
     if (elapsed >= ttl) {
       throw new RequestError('Challenge expired')
     }
 
-    // 6. 向签发 Challenge 的同一域名提交
     return this.request('/api/user/checkin', {
       method: 'POST',
       headers: {
@@ -259,7 +253,7 @@ class GladosClient {
   }
 
   // --------------------
-  // 签到重试
+  // 签到及重试
   // --------------------
 
   async checkin() {
@@ -276,21 +270,21 @@ class GladosClient {
 
       try {
         const result = await this.checkinOnce()
+        const status = getCheckinResult(result)
 
-        if (isNormalCheckinResult(result)) {
+        if (status.success) {
           return {
             success: true,
+            alreadyChecked: status.alreadyChecked,
             message: result.message || 'Check-in completed',
           }
         }
 
         lastError = new RequestError(
-          result.message || `Check-in failed (code=${result.code})`
+          result.message || `Check-in failed (code=${result.code})`,
+          null,
+          true
         )
-
-        if (isAuthDenied(lastError)) {
-          break
-        }
 
       } catch (error) {
         lastError = error
@@ -299,7 +293,6 @@ class GladosClient {
           `[${this.domain}] ${safeError(error)}`
         )
 
-        // 404、认证失败等不可重试错误直接退出
         if (
           isAuthDenied(error) ||
           error.retryable === false
@@ -319,6 +312,7 @@ class GladosClient {
 
     return {
       success: false,
+      alreadyChecked: false,
       message: safeError(lastError || new Error('Check-in failed')),
     }
   }
@@ -419,6 +413,7 @@ async function runAccount(account, index) {
     index,
     domain: account.domain,
     success: false,
+    alreadyChecked: false,
     message: '',
     email: '未获取',
     points: '未获取',
@@ -430,10 +425,10 @@ async function runAccount(account, index) {
   const checkinResult = await client.checkin()
 
   result.success = checkinResult.success
+  result.alreadyChecked = checkinResult.alreadyChecked
   result.message = checkinResult.message
 
-  // 签到成功后再获取账户状态
-  // 状态查询失败不改变已经确认的签到结果
+  // 签到成功或今日已经签到，都查询账户状态
   if (result.success) {
     try {
       await client.getStatus()
@@ -483,7 +478,7 @@ function buildReport(results) {
     : `GLaDOS签到异常 ${successCount}/${total}`
 
   const lines = [
-    `## GLaDOS 自动签到报告`,
+    '## GLaDOS 自动签到报告',
     '',
     `**运行结果：** ${allSuccess ? '全部成功' : '存在失败'}`,
     `**成功账号：** ${successCount}/${total}`,
@@ -494,7 +489,7 @@ function buildReport(results) {
     lines.push(
       `### 账号 ${item.index} (${item.domain})`,
       '',
-      `- 签到状态：${item.success ? '成功' : '失败'}`,
+      `- 签到状态：${item.success ? (item.alreadyChecked ? '今日已签到' : '成功') : '失败'}`,
       `- 签到结果：${item.message}`,
       `- 当前积分：${item.points}`,
       `- 积分变化：${item.pointsChange}`,
@@ -509,7 +504,7 @@ function buildReport(results) {
   }
 
   lines.push(
-    `---`,
+    '---',
     `运行时间：${new Date().toLocaleString('zh-CN', {
       timeZone: 'Asia/Shanghai',
       hour12: false,
@@ -528,6 +523,13 @@ function buildReport(results) {
 // -------------------- 主程序 --------------------
 
 async function main() {
+  console.log(
+    '[Config] ServerChan:',
+    process.env.SERVERCHAN_SENDKEY
+      ? 'Secret loaded'
+      : 'Secret missing'
+  )
+
   const accounts = getAccounts()
 
   if (accounts.length === 0) {
@@ -552,6 +554,7 @@ async function main() {
         index: i + 1,
         domain: accounts[i].domain,
         success: false,
+        alreadyChecked: false,
         message: safeError(error),
         email: '未获取',
         points: '未获取',
@@ -566,8 +569,7 @@ async function main() {
 
   console.log('\n' + report.content)
 
-  // fail_only：所有账号成功时不推送
-  // all：每次执行均推送
+  // Server酱通知
   const pushLevel = (
     process.env.PUSH_LEVEL || 'fail_only'
   ).trim().toLowerCase()
@@ -584,20 +586,27 @@ async function main() {
         'SERVERCHAN_SENDKEY is not configured; notification skipped.'
       )
     } else {
-      await sendServerChan(
-        sendKey,
-        report.title,
-        report.content
-      )
-    }
+      try {
+        await sendServerChan(
+          sendKey,
+          report.title,
+          report.content
+        )
 
+        console.log('Server酱推送成功')
+      } catch (error) {
+        console.error(
+          `Server酱推送失败：${safeError(error)}`
+        )
+      }
+    }
   } else {
     console.log(
       'All accounts succeeded; notification skipped (PUSH_LEVEL=fail_only).'
     )
   }
 
-  // 任意账号签到失败，Actions 标记为失败
+  // 只有真正签到失败的账号才导致 Actions 失败
   if (!report.allSuccess) {
     process.exitCode = 1
   }
