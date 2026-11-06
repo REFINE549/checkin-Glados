@@ -84,10 +84,20 @@ async function requestJson(url, options = {}) {
     )
   }
 
+  // 认证失败：不重试
   if (response.status === 401 || response.status === 403) {
     throw new RequestError(
       'Authentication rejected',
       response.status,
+      false
+    )
+  }
+
+  // API 不存在：不重试
+  if (response.status === 404) {
+    throw new RequestError(
+      'HTTP 404',
+      404,
       false
     )
   }
@@ -99,14 +109,16 @@ async function requestJson(url, options = {}) {
   } catch {
     throw new RequestError(
       `Invalid JSON response (HTTP ${response.status})`,
-      response.status
+      response.status,
+      response.status >= 500 || response.status === 429
     )
   }
 
   if (!response.ok) {
     throw new RequestError(
       `HTTP ${response.status}`,
-      response.status
+      response.status,
+      response.status >= 500 || response.status === 429
     )
   }
 
@@ -152,8 +164,36 @@ class GladosClient {
     })
   }
 
-  // 每次调用均获取全新的 Challenge
+  // --------------------
+  // 签到逻辑
+  // --------------------
+
   async checkinOnce() {
+
+    // ==================================================
+    // Railgun：恢复旧版直接签到协议
+    // ==================================================
+
+    if (this.domain === 'railgun.info') {
+      console.log(
+        '[railgun.info] Using legacy check-in protocol'
+      )
+
+      return this.request('/api/user/checkin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          token: 'glados.network',
+        }),
+      })
+    }
+
+    // ==================================================
+    // GLaDOS：使用新版 Challenge 认证协议
+    // ==================================================
+
     // 1. 获取一次性 Challenge
     const challenge = await this.request(
       '/api/user/checkin/challenge',
@@ -218,6 +258,10 @@ class GladosClient {
     })
   }
 
+  // --------------------
+  // 签到重试
+  // --------------------
+
   async checkin() {
     let lastError
 
@@ -247,6 +291,7 @@ class GladosClient {
         if (isAuthDenied(lastError)) {
           break
         }
+
       } catch (error) {
         lastError = error
 
@@ -254,7 +299,11 @@ class GladosClient {
           `[${this.domain}] ${safeError(error)}`
         )
 
-        if (isAuthDenied(error) || error.retryable === false) {
+        // 404、认证失败等不可重试错误直接退出
+        if (
+          isAuthDenied(error) ||
+          error.retryable === false
+        ) {
           break
         }
       }
@@ -263,6 +312,7 @@ class GladosClient {
         console.log(
           `[${this.domain}] Retry in ${CONFIG.retryDelayMs / 1000}s`
         )
+
         await sleep(CONFIG.retryDelayMs)
       }
     }
@@ -272,6 +322,10 @@ class GladosClient {
       message: safeError(lastError || new Error('Check-in failed')),
     }
   }
+
+  // --------------------
+  // 查询账户状态
+  // --------------------
 
   async getStatus() {
     const result = await this.request('/api/user/status', {
@@ -285,6 +339,10 @@ class GladosClient {
     this.email = result.data.email || '未获取'
     this.leftDays = result.data.leftDays ?? '未获取'
   }
+
+  // --------------------
+  // 查询积分
+  // --------------------
 
   async getPoints() {
     const result = await this.request('/api/user/points', {
@@ -418,7 +476,6 @@ function buildReport(results) {
   ).length
 
   const total = results.length
-
   const allSuccess = successCount === total
 
   const title = allSuccess
@@ -489,6 +546,7 @@ async function main() {
     try {
       const result = await runAccount(accounts[i], i + 1)
       results.push(result)
+
     } catch (error) {
       results.push({
         index: i + 1,
@@ -532,6 +590,7 @@ async function main() {
         report.content
       )
     }
+
   } else {
     console.log(
       'All accounts succeeded; notification skipped (PUSH_LEVEL=fail_only).'
