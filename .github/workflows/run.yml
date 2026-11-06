@@ -20,5 +20,5 @@ jobs:
         env:
           GLADOS: ${{ secrets.GLADOS }}
           RAILGUN: ${{ secrets.RAILGUN }}
-          NOTIFY: ${{ secrets.NOTIFY }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT }}
