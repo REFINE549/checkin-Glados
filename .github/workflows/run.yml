@@ -22,3 +22,4 @@ jobs:
           RAILGUN: ${{ secrets.RAILGUN }}
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT }}
+          PUSH_LEVEL: ${{ vars.PUSH_LEVEL }}
