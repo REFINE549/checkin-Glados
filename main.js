@@ -1,258 +1,550 @@
-const glados = async () => {
-  const notice = []
 
-  const DEFAULT_USER_AGENT =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+import { createHash } from 'node:crypto'
+import { performance } from 'node:perf_hooks'
+import { sendServerChan } from './notifier.js'
 
-  // 判断新版 GLaDOS 的签到结果是否属于正常结果
-  const isNormalCheckinResult = (result) => {
-    if (!result || typeof result !== 'object') return false
+const CONFIG = {
+  challengeWaitMs: 2700,
+  maxAttempts: 3,
+  retryDelayMs: 60000,
+  requestTimeoutMs: 15000,
+}
 
-    const message = String(result?.message || '').trim().toLowerCase()
+const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
-    const normalMessages = [
-      'checkin! got',
-      'checkin repeats! please try tomorrow',
-      "today's observation logged",
-    ]
+const sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms))
 
-    if (normalMessages.some((marker) => message.includes(marker))) {
-      return true
-    }
+class RequestError extends Error {
+  constructor(message, status = null, retryable = true) {
+    super(message)
+    this.name = 'RequestError'
+    this.status = status
+    this.retryable = retryable
+  }
+}
 
-    // 历史及当前版本的正常成功返回
-    return result?.code === 0
+const safeError = (error) => {
+  if (error?.status) return `HTTP ${error.status}`
+
+  const message = String(error?.message || 'Unknown error')
+
+  if (/cookie|token|nonce|proof|authorization|sendkey/i.test(message)) {
+    return '请求失败，敏感错误信息已隐藏'
   }
 
-  // 通用 JSON 请求
-  const requestJson = async (url, options = {}) => {
-    const response = await fetch(url, options)
+  return message.slice(0, 180)
+}
 
-    const text = await response.text()
+const isAuthDenied = (error) => {
+  return (
+    error?.status === 401 ||
+    error?.status === 403 ||
+    /device-mismatch|automated check-in detected|unauthorized|没有权限/i.test(
+      String(error?.message || '')
+    )
+  )
+}
 
-    let data
-    try {
-      data = JSON.parse(text)
-    } catch {
-      throw new Error(
-        `HTTP ${response.status}: ${text.slice(0, 200) || 'Invalid JSON response'}`
-      )
-    }
+const isNormalCheckinResult = (result) => {
+  if (!result || typeof result !== 'object') return false
 
-    if (!response.ok) {
-      throw new Error(
-        data?.message || `HTTP ${response.status}`
-      )
-    }
+  const message = String(result.message || '').toLowerCase()
 
-    return data
+  const normalMessages = [
+    'checkin! got',
+    'checkin repeats! please try tomorrow',
+    "today's observation logged",
+  ]
+
+  return (
+    normalMessages.some((item) => message.includes(item)) ||
+    result.code === 0
+  )
+}
+
+// -------------------- HTTP --------------------
+
+async function requestJson(url, options = {}) {
+  let response
+
+  try {
+    response = await fetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(CONFIG.requestTimeoutMs),
+    })
+  } catch (error) {
+    const timeout =
+      error?.name === 'TimeoutError' ||
+      error?.name === 'AbortError'
+
+    throw new RequestError(
+      timeout ? 'Request timeout' : 'Network request failed'
+    )
   }
 
-  // 通用的签到执行函数
-  const doCheckin = async (
-    cookie,
-    domain,
-    token,
-    userAgent = DEFAULT_USER_AGENT
-  ) => {
-    if (!cookie) return
+  if (response.status === 401 || response.status === 403) {
+    throw new RequestError(
+      'Authentication rejected',
+      response.status,
+      false
+    )
+  }
 
-    try {
-      const common = {
-        'cookie': cookie,
-        'origin': `https://${domain}`,
-        'referer': `https://${domain}/console/checkin`,
-        'user-agent': userAgent,
-        'accept': 'application/json, text/plain, */*',
+  let data
+
+  try {
+    data = await response.json()
+  } catch {
+    throw new RequestError(
+      `Invalid JSON response (HTTP ${response.status})`,
+      response.status
+    )
+  }
+
+  if (!response.ok) {
+    throw new RequestError(
+      `HTTP ${response.status}`,
+      response.status
+    )
+  }
+
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new RequestError('Invalid API response')
+  }
+
+  return data
+}
+
+// -------------------- GLaDOS Client --------------------
+
+class GladosClient {
+  constructor({ cookie, domain, userAgent }) {
+    this.cookie = cookie
+    this.origin = `https://${domain}`
+    this.domain = domain
+    this.userAgent = userAgent || DEFAULT_USER_AGENT
+
+    this.email = '未获取'
+    this.leftDays = '未获取'
+    this.points = '未获取'
+    this.pointsChange = '未获取'
+  }
+
+  get headers() {
+    return {
+      Cookie: this.cookie,
+      Origin: this.origin,
+      Referer: `${this.origin}/console/checkin`,
+      'User-Agent': this.userAgent,
+      Accept: 'application/json, text/plain, */*',
+    }
+  }
+
+  async request(path, options = {}) {
+    return requestJson(`${this.origin}${path}`, {
+      ...options,
+      headers: {
+        ...this.headers,
+        ...(options.headers || {}),
+      },
+    })
+  }
+
+  // 每次调用均获取全新的 Challenge
+  async checkinOnce() {
+    // 1. 获取一次性 Challenge
+    const challenge = await this.request(
+      '/api/user/checkin/challenge',
+      { method: 'GET' }
+    )
+
+    if (challenge.code !== 0) {
+      if (challenge.code === -2) {
+        throw new RequestError(
+          'Challenge authentication rejected',
+          null,
+          false
+        )
       }
 
-      let action = null
-      let lastError = null
+      throw new RequestError('Challenge unavailable')
+    }
 
-      // 签到失败时最多重试 3 次
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          action = await requestJson(
-            `https://${domain}/api/user/checkin`,
-            {
-              method: 'POST',
-              headers: {
-                ...common,
-                'content-type': 'application/json',
-              },
-              body: JSON.stringify({
-                token: token,
-              }),
-            }
-          )
+    const nonce = challenge.nonce
+    const ttl = challenge.ttl ?? 300000
 
-          // 新版 GLaDOS 的“重复签到”也属于正常结果
-          if (isNormalCheckinResult(action)) {
-            break
+    if (
+      typeof nonce !== 'string' ||
+      nonce.length === 0 ||
+      nonce.length > 4096 ||
+      typeof ttl !== 'number' ||
+      !Number.isFinite(ttl) ||
+      ttl <= CONFIG.challengeWaitMs
+    ) {
+      throw new RequestError('Invalid Challenge')
+    }
+
+    // 2. 记录获取时间
+    const receivedAt = performance.now()
+
+    // 3. 按官网算法计算 proof
+    const proof = createHash('sha256')
+      .update(`${nonce}.glados-observe-v1`, 'utf8')
+      .digest('hex')
+
+    // 4. 等待官网要求的时间
+    await sleep(CONFIG.challengeWaitMs)
+
+    // 5. 检查 Challenge 是否过期
+    const elapsed = performance.now() - receivedAt
+
+    if (elapsed >= ttl) {
+      throw new RequestError('Challenge expired')
+    }
+
+    // 6. 向签发 Challenge 的同一域名提交
+    return this.request('/api/user/checkin', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        token: new URL(this.origin).hostname,
+        nonce,
+        proof,
+      }),
+    })
+  }
+
+  async checkin() {
+    let lastError
+
+    for (
+      let attempt = 1;
+      attempt <= CONFIG.maxAttempts;
+      attempt++
+    ) {
+      console.log(
+        `[${this.domain}] Check-in ${attempt}/${CONFIG.maxAttempts}`
+      )
+
+      try {
+        const result = await this.checkinOnce()
+
+        if (isNormalCheckinResult(result)) {
+          return {
+            success: true,
+            message: result.message || 'Check-in completed',
           }
-
-          lastError = new Error(
-            action?.message ||
-            `Checkin failed (code=${action?.code})`
-          )
-        } catch (error) {
-          lastError = error
         }
 
-        if (attempt < 3) {
-          await new Promise((resolve) => setTimeout(resolve, 60000))
-        }
-      }
-
-      // 三次均未得到正常结果
-      if (!isNormalCheckinResult(action)) {
-        throw lastError ||
-          new Error('Checkin failed')
-      }
-
-      // 签到成功后再查询状态
-      const status = await requestJson(
-        `https://${domain}/api/user/status`,
-        {
-          method: 'GET',
-          headers: {
-            ...common,
-          },
-        }
-      )
-
-      if (status?.code) {
-        throw new Error(
-          status?.message || `Status request failed (code=${status?.code})`
+        lastError = new RequestError(
+          result.message || `Check-in failed (code=${result.code})`
         )
+
+        if (isAuthDenied(lastError)) {
+          break
+        }
+      } catch (error) {
+        lastError = error
+
+        console.log(
+          `[${this.domain}] ${safeError(error)}`
+        )
+
+        if (isAuthDenied(error) || error.retryable === false) {
+          break
+        }
       }
 
-      notice.push(
-        `[${domain}] Checkin OK`,
-        `${action?.message || ''}`,
-        `Left Days ${Number(status?.data?.leftDays ?? 0)}`
-      )
-    } catch (error) {
-      notice.push(
-        `[${domain}] Checkin Error`,
-        `${error?.message || error}`,
-        `<${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`
-      )
+      if (attempt < CONFIG.maxAttempts) {
+        console.log(
+          `[${this.domain}] Retry in ${CONFIG.retryDelayMs / 1000}s`
+        )
+        await sleep(CONFIG.retryDelayMs)
+      }
+    }
+
+    return {
+      success: false,
+      message: safeError(lastError || new Error('Check-in failed')),
     }
   }
 
-  // 1. 处理原站点 (glados.cloud) 的账号签到
-  if (process.env.GLADOS) {
-    for (const cookie of String(process.env.GLADOS).split('\n')) {
-      if (cookie.trim()) {
-        await doCheckin(
-          cookie.trim(),
-          'glados.cloud',
-          'glados.cloud',
-          process.env.GLADOS_USER_AGENT || DEFAULT_USER_AGENT
-        )
+  async getStatus() {
+    const result = await this.request('/api/user/status', {
+      method: 'GET',
+    })
+
+    if (result.code !== 0 || !result.data) {
+      throw new RequestError('Status query failed')
+    }
+
+    this.email = result.data.email || '未获取'
+    this.leftDays = result.data.leftDays ?? '未获取'
+  }
+
+  async getPoints() {
+    const result = await this.request('/api/user/points', {
+      method: 'GET',
+    })
+
+    if (typeof result.points === 'undefined') {
+      throw new RequestError('Points query failed')
+    }
+
+    this.points = result.points
+
+    const history = Array.isArray(result.history)
+      ? result.history
+      : []
+
+    if (history.length > 0) {
+      const change = Number(history[0].change)
+
+      if (Number.isFinite(change)) {
+        this.pointsChange =
+          change > 0 ? `+${change}` : String(change)
       }
     }
   }
-
-  // 2. 处理新站点 (railgun.info) 的账号签到
-  if (process.env.RAILGUN) {
-    for (const cookie of String(process.env.RAILGUN).split('\n')) {
-      if (cookie.trim()) {
-        // 若签到报错 token 错误，可将下方的 'glados.network' 改回 'glados.cloud' 尝试
-        await doCheckin(
-          cookie.trim(),
-          'railgun.info',
-          'glados.network',
-          process.env.RAILGUN_USER_AGENT || DEFAULT_USER_AGENT
-        )
-      }
-    }
-  }
-
-  return notice
 }
 
-const notify = async (notice) => {
-  if (!process.env.NOTIFY || !notice) return
+// -------------------- 账号配置 --------------------
 
-  for (const option of String(process.env.NOTIFY).split('\n')) {
-    if (!option) continue
+function getAccounts() {
+  const accounts = []
+
+  const gladosCookies = String(
+    process.env.GLADOS || ''
+  )
+    .split('\n')
+    .map((item) => item.trim())
+    .filter(Boolean)
+
+  for (const cookie of gladosCookies) {
+    accounts.push({
+      cookie,
+      domain: 'glados.cloud',
+      userAgent:
+        process.env.GLADOS_USER_AGENT || DEFAULT_USER_AGENT,
+    })
+  }
+
+  const railgunCookies = String(
+    process.env.RAILGUN || ''
+  )
+    .split('\n')
+    .map((item) => item.trim())
+    .filter(Boolean)
+
+  for (const cookie of railgunCookies) {
+    accounts.push({
+      cookie,
+      domain: 'railgun.info',
+      userAgent:
+        process.env.RAILGUN_USER_AGENT || DEFAULT_USER_AGENT,
+    })
+  }
+
+  return accounts
+}
+
+// -------------------- 执行单个账号 --------------------
+
+async function runAccount(account, index) {
+  const client = new GladosClient(account)
+
+  const result = {
+    index,
+    domain: account.domain,
+    success: false,
+    message: '',
+    email: '未获取',
+    points: '未获取',
+    pointsChange: '未获取',
+    leftDays: '未获取',
+    detailError: '',
+  }
+
+  const checkinResult = await client.checkin()
+
+  result.success = checkinResult.success
+  result.message = checkinResult.message
+
+  // 签到成功后再获取账户状态
+  // 状态查询失败不改变已经确认的签到结果
+  if (result.success) {
+    try {
+      await client.getStatus()
+    } catch (error) {
+      result.detailError +=
+        `状态查询失败：${safeError(error)}；`
+    }
 
     try {
-      if (option.startsWith('console:')) {
-        for (const line of notice) {
-          console.log(line)
-        }
-      } else if (option.startsWith('wxpusher:')) {
-        await fetch(`https://wxpusher.zjiecode.com/api/send/message`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            appToken: option.split(':')[1],
-            summary: notice[0],
-            content: notice.join('<br>'),
-            contentType: 3,
-            uids: option.split(':').slice(2),
-          }),
-        })
-      } else if (option.startsWith('pushplus:')) {
-        await fetch(`https://www.pushplus.plus/send`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            token: option.split(':')[1],
-            title: notice[0],
-            content: notice.join('<br>'),
-            template: 'markdown',
-          }),
-        })
-      } else if (option.startsWith('qyweixin:')) {
-        const qyweixinToken = option.split(':')[1]
-
-        const qyweixinNotifyRebotUrl =
-          'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=' +
-          qyweixinToken
-
-        await fetch(qyweixinNotifyRebotUrl, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            msgtype: 'markdown',
-            markdown: {
-              content: notice.join('<br>'),
-            },
-          }),
-        })
-      } else {
-        // fallback
-        await fetch(`https://www.pushplus.plus/send`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            token: option,
-            title: notice[0],
-            content: notice.join('<br>'),
-            template: 'markdown',
-          }),
-        })
-      }
+      await client.getPoints()
     } catch (error) {
-      throw error
+      result.detailError +=
+        `积分查询失败：${safeError(error)}；`
     }
+  }
+
+  result.email = client.email
+  result.points = client.points
+  result.pointsChange = client.pointsChange
+  result.leftDays = client.leftDays
+
+  console.log(
+    `[${account.domain}] Account ${index}: ${
+      result.success ? 'SUCCESS' : 'FAILED'
+    }`
+  )
+
+  console.log(`签到结果：${result.message}`)
+  console.log(`积分：${result.points}`)
+  console.log(`剩余天数：${result.leftDays}`)
+
+  return result
+}
+
+// -------------------- 汇总报告 --------------------
+
+function buildReport(results) {
+  const successCount = results.filter(
+    (item) => item.success
+  ).length
+
+  const total = results.length
+
+  const allSuccess = successCount === total
+
+  const title = allSuccess
+    ? `GLaDOS签到成功 ${successCount}/${total}`
+    : `GLaDOS签到异常 ${successCount}/${total}`
+
+  const lines = [
+    `## GLaDOS 自动签到报告`,
+    '',
+    `**运行结果：** ${allSuccess ? '全部成功' : '存在失败'}`,
+    `**成功账号：** ${successCount}/${total}`,
+    '',
+  ]
+
+  for (const item of results) {
+    lines.push(
+      `### 账号 ${item.index} (${item.domain})`,
+      '',
+      `- 签到状态：${item.success ? '成功' : '失败'}`,
+      `- 签到结果：${item.message}`,
+      `- 当前积分：${item.points}`,
+      `- 积分变化：${item.pointsChange}`,
+      `- 剩余天数：${item.leftDays}`,
+    )
+
+    if (item.detailError) {
+      lines.push(`- 附加信息：${item.detailError}`)
+    }
+
+    lines.push('')
+  }
+
+  lines.push(
+    `---`,
+    `运行时间：${new Date().toLocaleString('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      hour12: false,
+    })} (UTC+8)`
+  )
+
+  return {
+    title,
+    content: lines.join('\n'),
+    successCount,
+    total,
+    allSuccess,
   }
 }
 
-const main = async () => {
-  await notify(await glados())
+// -------------------- 主程序 --------------------
+
+async function main() {
+  const accounts = getAccounts()
+
+  if (accounts.length === 0) {
+    console.error(
+      'No accounts configured. Please set GLADOS or RAILGUN.'
+    )
+    process.exitCode = 1
+    return
+  }
+
+  console.log(`共检测到 ${accounts.length} 个账号`)
+
+  const results = []
+
+  for (let i = 0; i < accounts.length; i++) {
+    try {
+      const result = await runAccount(accounts[i], i + 1)
+      results.push(result)
+    } catch (error) {
+      results.push({
+        index: i + 1,
+        domain: accounts[i].domain,
+        success: false,
+        message: safeError(error),
+        email: '未获取',
+        points: '未获取',
+        pointsChange: '未获取',
+        leftDays: '未获取',
+        detailError: '',
+      })
+    }
+  }
+
+  const report = buildReport(results)
+
+  console.log('\n' + report.content)
+
+  // fail_only：所有账号成功时不推送
+  // all：每次执行均推送
+  const pushLevel = (
+    process.env.PUSH_LEVEL || 'fail_only'
+  ).trim().toLowerCase()
+
+  const shouldPush =
+    pushLevel === 'all' ||
+    (pushLevel === 'fail_only' && !report.allSuccess)
+
+  if (shouldPush) {
+    const sendKey = process.env.SERVERCHAN_SENDKEY
+
+    if (!sendKey) {
+      console.error(
+        'SERVERCHAN_SENDKEY is not configured; notification skipped.'
+      )
+    } else {
+      await sendServerChan(
+        sendKey,
+        report.title,
+        report.content
+      )
+    }
+  } else {
+    console.log(
+      'All accounts succeeded; notification skipped (PUSH_LEVEL=fail_only).'
+    )
+  }
+
+  // 任意账号签到失败，Actions 标记为失败
+  if (!report.allSuccess) {
+    process.exitCode = 1
+  }
 }
 
-main()
+main().catch((error) => {
+  console.error(`Fatal error: ${safeError(error)}`)
+  process.exitCode = 1
+})
